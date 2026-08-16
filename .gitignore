@@ -1,0 +1,6 @@
+app/node_modules/
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log

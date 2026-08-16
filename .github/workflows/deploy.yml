@@ -1,0 +1,162 @@
+name: Deploy Web Application
+
+on:
+
+  push:
+    branches:
+      - main
+
+jobs:
+
+  test:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+
+        with:
+          node-version: 22
+
+      - name: Install Dependencies
+        working-directory: app
+        run: npm install
+
+      - name: Run Tests
+        working-directory: app
+        run: npm test
+
+  deploy:
+
+    needs: test
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: us-east-1
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Destroy Previous Environment
+        run: |
+          INSTANCE_IDS=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=devops-summative-web" \
+            "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query "Reservations[].Instances[].InstanceId" \
+            --output text)
+
+          if [ -n "$INSTANCE_IDS" ] && [ "$INSTANCE_IDS" != "None" ]; then
+            aws ec2 terminate-instances --instance-ids $INSTANCE_IDS
+            aws ec2 wait instance-terminated --instance-ids $INSTANCE_IDS
+          fi
+
+          GROUP_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=devops-summative-web-sg" \
+            --query "SecurityGroups[0].GroupId" \
+            --output text)
+
+          if [ -n "$GROUP_ID" ] && [ "$GROUP_ID" != "None" ]; then
+            aws ec2 delete-security-group --group-id "$GROUP_ID"
+          fi
+
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Name,Values=devops-summative-web-vpc" \
+            --query "Vpcs[0].VpcId" \
+            --output text)
+
+          if [ -n "$VPC_ID" ] && [ "$VPC_ID" != "None" ]; then
+            ROUTE_TABLE_ID=$(aws ec2 describe-route-tables \
+              --filters "Name=tag:Name,Values=devops-summative-web-public-route-table" \
+              --query "RouteTables[0].RouteTableId" \
+              --output text)
+
+            if [ -n "$ROUTE_TABLE_ID" ] && [ "$ROUTE_TABLE_ID" != "None" ]; then
+              ASSOCIATION_ID=$(aws ec2 describe-route-tables \
+                --route-table-ids "$ROUTE_TABLE_ID" \
+                --query "RouteTables[0].Associations[?Main==\`false\`].RouteTableAssociationId | [0]" \
+                --output text)
+
+              if [ -n "$ASSOCIATION_ID" ] && [ "$ASSOCIATION_ID" != "None" ]; then
+                aws ec2 disassociate-route-table --association-id "$ASSOCIATION_ID"
+              fi
+
+              aws ec2 delete-route-table --route-table-id "$ROUTE_TABLE_ID"
+            fi
+
+            INTERNET_GATEWAY_ID=$(aws ec2 describe-internet-gateways \
+              --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
+              --query "InternetGateways[0].InternetGatewayId" \
+              --output text)
+
+            if [ -n "$INTERNET_GATEWAY_ID" ] && [ "$INTERNET_GATEWAY_ID" != "None" ]; then
+              aws ec2 detach-internet-gateway \
+                --internet-gateway-id "$INTERNET_GATEWAY_ID" \
+                --vpc-id "$VPC_ID"
+              aws ec2 delete-internet-gateway \
+                --internet-gateway-id "$INTERNET_GATEWAY_ID"
+            fi
+
+            SUBNET_IDS=$(aws ec2 describe-subnets \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query "Subnets[].SubnetId" \
+              --output text)
+
+            for SUBNET_ID in $SUBNET_IDS; do
+              aws ec2 delete-subnet --subnet-id "$SUBNET_ID"
+            done
+
+            aws ec2 delete-vpc --vpc-id "$VPC_ID"
+          fi
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Terraform Apply
+        working-directory: terraform
+        run: terraform apply -auto-approve
+
+      - name: Get Public IP
+        working-directory: terraform
+        run: |
+          echo "PUBLIC_IP=$(terraform output -raw public_ip)" >> $GITHUB_ENV
+
+      - name: Install Ansible
+        run: |
+          sudo apt update
+          sudo apt install -y ansible
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          sleep 120
+          ssh-keyscan -H $PUBLIC_IP >> ~/.ssh/known_hosts
+
+      - name: Create Inventory
+        run: |
+          cat <<EOF > ansible/inventory.ini
+          [web]
+          $PUBLIC_IP
+          EOF
+
+      - name: Deploy
+        run: |
+          ansible-playbook \
+          -i ansible/inventory.ini \
+          -u ec2-user \
+          --private-key ~/.ssh/id_rsa \
+          ansible/site.yml
