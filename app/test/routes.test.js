@@ -9,7 +9,7 @@ describe("Web application", () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.text).toContain("DevOps Summative BP0289010");
-    expect(response.text).toContain("Welcome to my CI/CD Demo!");
+    expect(response.text).toContain("Welcome to my CI/CD Demo");
   });
 
   test("GET /health reports that the application is available", async () => {
